@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
-
+from nanovllm.constants import ATTN_TP_SIZE
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
@@ -59,9 +59,11 @@ class ColumnParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        is_attn: bool = False,
     ):
         super().__init__(input_size, output_size, 0)
         self.input_size_per_partition = input_size
+        self.tp_size = ATTN_TP_SIZE if is_attn else self.tp_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
 
         self.weight = nn.Parameter(torch.empty(self.output_size_per_partition, self.input_size))
@@ -116,12 +118,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.head_size = head_size
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads or total_num_heads
-        tp_size = dist.get_world_size()
-        self.num_heads = divide(self.total_num_heads, tp_size)
-        self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+        self.num_heads = divide(self.total_num_heads, ATTN_TP_SIZE)
+        self.num_kv_heads = divide(self.total_num_kv_heads, ATTN_TP_SIZE)
         input_size = hidden_size
         output_size = (self.total_num_heads + 2 * self.total_num_kv_heads) * self.head_size
-        super().__init__(input_size, output_size, bias)
+        super().__init__(input_size, output_size, bias, is_attn=True)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
         param_data = param.data
@@ -147,9 +148,10 @@ class RowParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        is_attn: bool = False,
     ):
         super().__init__(input_size, output_size, 1)
-        self.input_size_per_partition = divide(input_size, self.tp_size)
+        self.input_size_per_partition = divide(input_size, ATTN_TP_SIZE if is_attn else self.tp_size)
         self.output_size_per_partition = output_size
 
         self.weight = nn.Parameter(torch.empty(self.output_size, self.input_size_per_partition))

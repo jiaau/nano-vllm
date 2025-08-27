@@ -1,5 +1,4 @@
 # Adapted from https://github.com/gogongxt/nano-vllm/blob/main/nanovllm/models/qwen3_moe.py
-
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -16,7 +15,7 @@ from nanovllm.layers.linear import (
     RowParallelLinear,
 )
 from nanovllm.layers.rotary_embedding import get_rope
-
+from nanovllm.constants import ATTN_TP_SIZE
 
 class Qwen3MoeAttention(nn.Module):
 
@@ -33,13 +32,14 @@ class Qwen3MoeAttention(nn.Module):
         rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        if dist.get_rank() >= ATTN_TP_SIZE:
+            return
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        assert self.total_num_heads % ATTN_TP_SIZE == 0
+        self.num_heads = self.total_num_heads // ATTN_TP_SIZE
         self.total_num_kv_heads = num_kv_heads
-        assert self.total_num_kv_heads % tp_size == 0
-        self.num_kv_heads = self.total_num_kv_heads // tp_size
+        assert self.total_num_kv_heads % ATTN_TP_SIZE == 0
+        self.num_kv_heads = self.total_num_kv_heads // ATTN_TP_SIZE
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -56,6 +56,7 @@ class Qwen3MoeAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
+            is_attn=True,
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -78,6 +79,10 @@ class Qwen3MoeAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        if dist.get_rank() >= ATTN_TP_SIZE:
+            output = torch.zeros_like(hidden_states)
+            dist.all_reduce(output)
+            return output
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q_by_head = q.view(-1, self.num_heads, self.head_dim)
@@ -129,7 +134,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
         self.hidden_act = config.hidden_act
 
         self.num_experts = config.num_experts
@@ -149,7 +153,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor):
-        sequence_length, hidden_dim = hidden_states.shape
+        _, hidden_dim = hidden_states.shape # (sequence_length, hidden_dim)
         router_logits = self.gate(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)

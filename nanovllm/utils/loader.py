@@ -3,7 +3,8 @@ from glob import glob
 import torch
 from torch import nn
 from safetensors import safe_open
-
+import torch.distributed as dist
+from nanovllm.constants import ATTN_TP_SIZE
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
@@ -14,6 +15,8 @@ def load_model(model: nn.Module, path: str):
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
+                if dist.get_rank() >= ATTN_TP_SIZE and "self_attn" in weight_name:
+                    continue
                 for k in packed_modules_mapping:
                     if k in weight_name:
                         v, shard_id = packed_modules_mapping[k]

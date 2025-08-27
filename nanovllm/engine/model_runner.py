@@ -10,7 +10,7 @@ from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
-
+from nanovllm.constants import ATTN_TP_SIZE
 
 class ModelRunner:
 
@@ -40,6 +40,15 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
+                # Try to clean up existing shared memory first
+                try:
+                    existing_shm = SharedMemory(name="nanovllm")
+                    existing_shm.close()
+                    existing_shm.unlink()
+                except FileNotFoundError:
+                    # No existing shared memory, which is expected
+                    pass
+                
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
             else:
@@ -98,13 +107,15 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
+        if dist.get_rank() >= ATTN_TP_SIZE:
+            return
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        num_kv_heads = hf_config.num_key_value_heads // ATTN_TP_SIZE
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
@@ -117,6 +128,8 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
+        if dist.get_rank() >= ATTN_TP_SIZE:
+            return
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
